@@ -475,7 +475,7 @@ def main():
 
         log.info("Sleeping %d seconds until next check…\n", CHECK_EVERY_SEC)
         time.sleep(CHECK_EVERY_SEC)
-def main():
+
     send_telegram(
         TELEGRAM_BOT_TOKEN,
         TELEGRAM_CHAT_ID,
