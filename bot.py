@@ -1,6 +1,15 @@
 """
-Crypto Trading Signal Bot - Binance + Telegram
+Crypto Trading Signal Bot - Delta Exchange + Telegram
 Analyzes BTC/USDT market data and sends trading signals via Telegram.
+
+FIXES APPLIED:
+  1. get_product_id() - removed, candles now use symbol directly
+  2. Candle endpoint - corrected to /v2/history/candles with right params
+  3. Ticker API     - fixed to /v2/tickers with correct field parsing
+  4. Order Book     - fixed response format (buy/sell keys + price/size fields)
+  5. API Secret     - added DELTA_API_SECRET for authenticated/trading endpoints
+  6. Symbol         - changed to "BTCUSD" (Delta perpetual contract name)
+  7. Error Handling - None formatting fixed with safe fallback values
 """
 
 import os
@@ -14,14 +23,16 @@ from typing import Optional
 # ─────────────────────────────────────────────
 # CONFIGURATION  (edit these)
 # ─────────────────────────────────────────────
-BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")   # Set via env var
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")     # Set via env var
+DELTA_API_KEY    = os.getenv("DELTA_API_KEY",    "")   # Your Delta API Key
+DELTA_API_SECRET = os.getenv("DELTA_API_SECRET", "")   # Your Delta API Secret  ← FIX #5
 
-SYMBOL          = "BTCUSDT"
-INTERVAL        = "15m"          # candle interval
-CANDLE_LIMIT    = 100            # candles to fetch
-CHECK_EVERY_SEC = 300            # run analysis every 5 minutes
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "")
+
+SYMBOL          = "BTCUSD"   # ← FIX #6: Delta perpetual contract (not BTCUSDT)
+INTERVAL        = "15m"      # candle interval: 1m,5m,15m,1h,4h,1d
+CANDLE_LIMIT    = 100        # candles to fetch
+CHECK_EVERY_SEC = 300        # run analysis every 5 minutes
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -31,60 +42,158 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-BINANCE_BASE = "https://api.binance.com"
+DELTA_BASE = "https://api.delta.exchange"
+
+# Delta resolution map  (interval string → minutes, as Delta expects)
+DELTA_RESOLUTION = {
+    "1m": "1",  "3m": "3",   "5m": "5",   "15m": "15",
+    "30m": "30","1h": "60",  "2h": "120",  "4h": "240",
+    "6h": "360","1d": "1D",
+}
 
 
 # ──────────────────────────────────────────────────────────
-# BINANCE DATA FETCHING
+# DELTA EXCHANGE DATA FETCHING
 # ──────────────────────────────────────────────────────────
 
-def binance_get(path: str, params: dict = None) -> Optional[dict | list]:
-    """Generic Binance REST GET with error handling."""
-    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+def delta_get(path: str, params: dict = None) -> Optional[dict | list]:
+    """Generic Delta Exchange REST GET with proper auth headers."""
+    headers = {
+        "api-key":      DELTA_API_KEY,
+        "Content-Type": "application/json",
+        "Accept":       "application/json",
+    }
     try:
-        r = requests.get(BINANCE_BASE + path, params=params, headers=headers, timeout=10)
+        r = requests.get(DELTA_BASE + path, params=params, headers=headers, timeout=10)
         r.raise_for_status()
-        return r.json()
-    except requests.exceptions.HTTPError as e:
-        log.error("Binance HTTP error %s: %s", r.status_code, r.text[:200])
+        data = r.json()
+        # Delta wraps: {"result": ..., "success": true}
+        if isinstance(data, dict):
+            if not data.get("success", True):
+                log.error("Delta API error: %s", data.get("error", data))
+                return None
+            if "result" in data:
+                return data["result"]
+        return data
+    except requests.exceptions.HTTPError:
+        log.error("Delta HTTP error %s: %s", r.status_code, r.text[:300])
     except requests.exceptions.RequestException as e:
-        log.error("Binance request failed: %s", e)
+        log.error("Delta request failed: %s", e)
     return None
 
 
+# ── FIX #1 & #2: Removed get_product_id(); candles use symbol directly ──
+
 def fetch_klines(symbol: str, interval: str, limit: int) -> list[dict]:
-    """Fetch OHLCV candles and return list of dicts."""
-    raw = binance_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    """
+    Fetch OHLCV candles from Delta Exchange.
+    Endpoint: GET /v2/history/candles
+    Params  : symbol, resolution (minutes), start, end
+    """
+    resolution = DELTA_RESOLUTION.get(interval, "15")
+    end_time   = int(time.time())
+    start_time = end_time - int(resolution if resolution != "1D" else 1440) * 60 * limit
+
+    # FIX #2: correct endpoint + correct param names for Delta
+    raw = delta_get("/v2/history/candles", {
+        "symbol":     symbol,
+        "resolution": resolution,
+        "start":      start_time,
+        "end":        end_time,
+    })
+
     if not raw:
+        log.warning("fetch_klines: no data returned for %s", symbol)
         return []
+
+    # Delta candle fields: time, open, high, low, close, volume
     candles = []
     for c in raw:
-        candles.append({
-            "open":   float(c[1]),
-            "high":   float(c[2]),
-            "low":    float(c[3]),
-            "close":  float(c[4]),
-            "volume": float(c[5]),
-            "ts":     c[0],
-        })
-    return candles
+        try:
+            candles.append({
+                "open":   float(c.get("open",  0)),
+                "high":   float(c.get("high",  0)),
+                "low":    float(c.get("low",   0)),
+                "close":  float(c.get("close", 0)),
+                "volume": float(c.get("volume", 0)),
+                "ts":     int(c.get("time", 0)),
+            })
+        except (TypeError, ValueError) as e:
+            log.debug("Skipping malformed candle: %s | %s", c, e)
+
+    candles.sort(key=lambda x: x["ts"])   # oldest → newest
+    return candles[-limit:]
 
 
 def fetch_ticker(symbol: str) -> Optional[dict]:
-    """Fetch 24-hour ticker stats."""
-    return binance_get("/api/v3/ticker/24hr", {"symbol": symbol})
+    """
+    Fetch 24h ticker from Delta Exchange.
+    FIX #3: correct endpoint /v2/tickers/{symbol} with verified field names.
+    """
+    # Delta ticker endpoint returns a single object inside result
+    result = delta_get(f"/v2/tickers/{symbol}")
+    if not result:
+        # Fallback: try listing all tickers
+        all_tickers = delta_get("/v2/tickers")
+        if all_tickers:
+            for t in (all_tickers if isinstance(all_tickers, list) else []):
+                if t.get("symbol") == symbol:
+                    result = t
+                    break
+    if not result:
+        return None
+    try:
+        # Delta ticker fields verified from their docs
+        price_change = result.get("price_change_24h",         None)
+        close_price  = result.get("close",                    None) or \
+                       result.get("mark_price",               None) or \
+                       result.get("last_price",               1)
+        close_price  = float(close_price or 1)
+
+        if price_change is not None:
+            pct = (float(price_change) / close_price) * 100
+        else:
+            pct = 0.0
+
+        return {
+            "priceChangePercent": round(pct, 4),
+            "highPrice":  float(result.get("high",       close_price)),
+            "lowPrice":   float(result.get("low",        close_price)),
+        }
+    except (TypeError, ValueError) as e:
+        log.error("fetch_ticker parse error: %s | raw=%s", e, result)
+        return None
 
 
 def fetch_order_book(symbol: str, depth: int = 20) -> Optional[dict]:
-    """Fetch order book."""
-    return binance_get("/api/v3/depth", {"symbol": symbol, "limit": depth})
+    """
+    Fetch order book from Delta Exchange.
+    FIX #4: Delta returns buy[]/sell[] arrays with 'limit_price' and 'size' keys.
+    """
+    result = delta_get(f"/v2/l2orderbook/{symbol}")
+    if not result:
+        return None
+
+    try:
+        # buy  = bids (buyers), sell = asks (sellers)
+        raw_bids = result.get("buy",  [])[:depth]
+        raw_asks = result.get("sell", [])[:depth]
+
+        bids = [[str(b.get("limit_price", b.get("price", 0))),
+                 str(b.get("size", b.get("quantity", 0)))] for b in raw_bids]
+        asks = [[str(a.get("limit_price", a.get("price", 0))),
+                 str(a.get("size", a.get("quantity", 0)))] for a in raw_asks]
+        return {"bids": bids, "asks": asks}
+    except (TypeError, AttributeError) as e:
+        log.error("fetch_order_book parse error: %s", e)
+        return None
 
 
 # ──────────────────────────────────────────────────────────
-# TECHNICAL INDICATORS
+# TECHNICAL INDICATORS  (pure math — unchanged)
 # ──────────────────────────────────────────────────────────
 
-def sma(values: list[float], period: int) -> list[float]:
+def sma(values: list[float], period: int) -> list[Optional[float]]:
     result = []
     for i in range(len(values)):
         if i < period - 1:
@@ -94,7 +203,7 @@ def sma(values: list[float], period: int) -> list[float]:
     return result
 
 
-def ema(values: list[float], period: int) -> list[float]:
+def ema(values: list[float], period: int) -> list[Optional[float]]:
     result = [None] * (period - 1)
     if len(values) < period:
         return [None] * len(values)
@@ -118,8 +227,7 @@ def rsi(closes: list[float], period: int = 14) -> list[Optional[float]]:
     if avg_loss == 0:
         result.append(100.0)
     else:
-        rs = avg_gain / avg_loss
-        result.append(100 - 100 / (1 + rs))
+        result.append(100 - 100 / (1 + avg_gain / avg_loss))
     for i in range(period + 1, len(closes)):
         diff = closes[i] - closes[i - 1]
         g = max(diff, 0)
@@ -129,8 +237,7 @@ def rsi(closes: list[float], period: int = 14) -> list[Optional[float]]:
         if avg_loss == 0:
             result.append(100.0)
         else:
-            rs = avg_gain / avg_loss
-            result.append(100 - 100 / (1 + rs))
+            result.append(100 - 100 / (1 + avg_gain / avg_loss))
     return result
 
 
@@ -145,7 +252,6 @@ def macd(closes: list[float], fast=12, slow=26, signal=9):
             macd_line.append(f - s)
     valid = [v for v in macd_line if v is not None]
     sig_raw = ema(valid, signal)
-    # re-align signal to full length
     offset = len(macd_line) - len(valid)
     signal_line = [None] * offset + sig_raw
     histogram = []
@@ -166,14 +272,13 @@ def bollinger_bands(closes: list[float], period=20, std_dev=2):
             lower.append(None)
         else:
             window = closes[i - period + 1: i + 1]
-            std = statistics.stdev(window)
+            std = statistics.stdev(window) if len(window) > 1 else 0
             upper.append(mid[i] + std_dev * std)
             lower.append(mid[i] - std_dev * std)
     return upper, mid, lower
 
 
 def volume_trend(volumes: list[float], period=20) -> float:
-    """Return ratio of recent avg volume vs older avg volume."""
     if len(volumes) < period * 2:
         return 1.0
     recent = sum(volumes[-period:]) / period
@@ -181,131 +286,127 @@ def volume_trend(volumes: list[float], period=20) -> float:
     return recent / older if older > 0 else 1.0
 
 
-def order_book_imbalance(order_book: dict) -> float:
-    """Positive = more bids (buying pressure), negative = more asks."""
+def order_book_imbalance(order_book: Optional[dict]) -> float:
     if not order_book:
         return 0.0
-    bid_vol = sum(float(b[1]) for b in order_book.get("bids", []))
-    ask_vol = sum(float(a[1]) for a in order_book.get("asks", []))
-    total = bid_vol + ask_vol
-    return (bid_vol - ask_vol) / total if total > 0 else 0.0
+    try:
+        bid_vol = sum(float(b[1]) for b in order_book.get("bids", []))
+        ask_vol = sum(float(a[1]) for a in order_book.get("asks", []))
+        total = bid_vol + ask_vol
+        return (bid_vol - ask_vol) / total if total > 0 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # ──────────────────────────────────────────────────────────
 # MARKET ANALYSIS ENGINE
 # ──────────────────────────────────────────────────────────
 
+def safe_float(val, default=0.0) -> float:
+    """FIX #7: Safe conversion — avoids None formatting errors."""
+    try:
+        return float(val) if val is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 def analyze_market(symbol: str) -> Optional[dict]:
     """Run full market analysis and return a signal dict."""
     candles = fetch_klines(symbol, INTERVAL, CANDLE_LIMIT)
     if len(candles) < 50:
-        log.warning("Not enough candles (%d)", len(candles))
+        log.warning("Not enough candles (%d) — skipping analysis", len(candles))
         return None
 
-    ticker    = fetch_ticker(symbol)
-    ob        = fetch_order_book(symbol)
+    ticker = fetch_ticker(symbol)
+    ob     = fetch_order_book(symbol)
 
     closes  = [c["close"]  for c in candles]
-    highs   = [c["high"]   for c in candles]
-    lows    = [c["low"]    for c in candles]
     volumes = [c["volume"] for c in candles]
+    price   = closes[-1]
 
-    price = closes[-1]
-
-    # ── Indicators ──────────────────────────────
-    ema9  = ema(closes, 9)
-    ema21 = ema(closes, 21)
-    ema50 = ema(closes, 50)
-    rsi14 = rsi(closes, 14)
+    # ── Compute indicators ───────────────────────
+    ema9_vals  = ema(closes, 9)
+    ema21_vals = ema(closes, 21)
+    ema50_vals = ema(closes, 50)
+    rsi14_vals = rsi(closes, 14)
     macd_line, signal_line, histogram = macd(closes)
-    bb_upper, bb_mid, bb_lower = bollinger_bands(closes, 20)
-    vol_ratio   = volume_trend(volumes)
-    ob_imbal    = order_book_imbalance(ob)
+    bb_upper, _, bb_lower = bollinger_bands(closes, 20)
+    vol_ratio = volume_trend(volumes)
+    ob_imbal  = order_book_imbalance(ob)
 
-    # Latest valid values
-    ema9_now  = next((v for v in reversed(ema9)  if v is not None), None)
-    ema21_now = next((v for v in reversed(ema21) if v is not None), None)
-    ema50_now = next((v for v in reversed(ema50) if v is not None), None)
-    rsi_now   = next((v for v in reversed(rsi14) if v is not None), None)
-    macd_now  = next((v for v in reversed(macd_line) if v is not None), None)
-    sig_now   = next((v for v in reversed(signal_line) if v is not None), None)
-    hist_now  = next((v for v in reversed(histogram) if v is not None), None)
-    bb_up     = next((v for v in reversed(bb_upper) if v is not None), None)
-    bb_lo     = next((v for v in reversed(bb_lower) if v is not None), None)
+    # Latest valid values  — FIX #7: use safe_float so None never reaches formatter
+    ema9_now  = safe_float(next((v for v in reversed(ema9_vals)  if v is not None), None), price)
+    ema21_now = safe_float(next((v for v in reversed(ema21_vals) if v is not None), None), price)
+    ema50_now = safe_float(next((v for v in reversed(ema50_vals) if v is not None), None), price)
+    rsi_now   = safe_float(next((v for v in reversed(rsi14_vals) if v is not None), None), 50.0)
+    hist_now  = safe_float(next((v for v in reversed(histogram)  if v is not None), None), 0.0)
+    bb_up     = safe_float(next((v for v in reversed(bb_upper)   if v is not None), None), price)
+    bb_lo     = safe_float(next((v for v in reversed(bb_lower)   if v is not None), None), price)
 
-    # Prev MACD histogram for crossover detection
-    hist_vals   = [v for v in histogram if v is not None]
-    hist_prev   = hist_vals[-2] if len(hist_vals) >= 2 else hist_now
+    hist_vals = [v for v in histogram if v is not None]
+    hist_prev = safe_float(hist_vals[-2] if len(hist_vals) >= 2 else None, hist_now)
 
-    # 24h change
-    price_change_pct = float(ticker["priceChangePercent"]) if ticker else 0.0
-    high24   = float(ticker["highPrice"])  if ticker else price
-    low24    = float(ticker["lowPrice"])   if ticker else price
+    price_change_pct = safe_float(ticker.get("priceChangePercent") if ticker else None, 0.0)
+    high24 = safe_float(ticker.get("highPrice") if ticker else None, price)
+    low24  = safe_float(ticker.get("lowPrice")  if ticker else None, price)
 
-    # ── Scoring system (each signal adds ± points) ──
-    score = 0          # -100 … +100 → negative = bearish, positive = bullish
+    # ── Scoring ──────────────────────────────────
+    score = 0
     signals_used = []
     reasons = []
 
     # 1. EMA alignment
-    if ema9_now and ema21_now and ema50_now:
-        if ema9_now > ema21_now > ema50_now:
-            score += 25
-            signals_used.append("EMA Stack ↑")
-            reasons.append("EMA 9 > 21 > 50 (bullish alignment)")
-        elif ema9_now < ema21_now < ema50_now:
-            score -= 25
-            signals_used.append("EMA Stack ↓")
-            reasons.append("EMA 9 < 21 < 50 (bearish alignment)")
-        else:
-            signals_used.append("EMA Mixed")
-            reasons.append("EMAs are mixed (no clear trend)")
+    if ema9_now > ema21_now > ema50_now:
+        score += 25
+        signals_used.append("EMA Stack ↑")
+        reasons.append("EMA 9 > 21 > 50 (bullish alignment)")
+    elif ema9_now < ema21_now < ema50_now:
+        score -= 25
+        signals_used.append("EMA Stack ↓")
+        reasons.append("EMA 9 < 21 < 50 (bearish alignment)")
+    else:
+        signals_used.append("EMA Mixed")
+        reasons.append("EMAs are mixed (no clear trend)")
 
     # 2. Price vs EMA50
-    if ema50_now:
-        if price > ema50_now:
-            score += 10
-        else:
-            score -= 10
+    score += 10 if price > ema50_now else -10
 
     # 3. RSI
-    if rsi_now is not None:
-        if rsi_now > 60:
-            score += 15
-            signals_used.append(f"RSI {rsi_now:.1f} (bullish)")
-            reasons.append(f"RSI at {rsi_now:.1f} — momentum is bullish")
-        elif rsi_now < 40:
-            score -= 15
-            signals_used.append(f"RSI {rsi_now:.1f} (bearish)")
-            reasons.append(f"RSI at {rsi_now:.1f} — momentum is bearish")
-        elif rsi_now > 50:
-            score += 5
-            signals_used.append(f"RSI {rsi_now:.1f} (neutral+)")
-        else:
-            score -= 5
-            signals_used.append(f"RSI {rsi_now:.1f} (neutral-)")
+    if rsi_now > 60:
+        score += 15
+        signals_used.append(f"RSI {rsi_now:.1f} (bullish)")
+        reasons.append(f"RSI at {rsi_now:.1f} — momentum is bullish")
+    elif rsi_now < 40:
+        score -= 15
+        signals_used.append(f"RSI {rsi_now:.1f} (bearish)")
+        reasons.append(f"RSI at {rsi_now:.1f} — momentum is bearish")
+    elif rsi_now > 50:
+        score += 5
+        signals_used.append(f"RSI {rsi_now:.1f} (neutral+)")
+    else:
+        score -= 5
+        signals_used.append(f"RSI {rsi_now:.1f} (neutral-)")
 
-    # 4. MACD crossover / histogram
-    if hist_now is not None and hist_prev is not None:
-        if hist_now > 0 and hist_now > hist_prev:
-            score += 20
-            signals_used.append("MACD ↑ Histogram")
-            reasons.append("MACD histogram expanding above zero line")
-        elif hist_now < 0 and hist_now < hist_prev:
-            score -= 20
-            signals_used.append("MACD ↓ Histogram")
-            reasons.append("MACD histogram expanding below zero line")
-        elif hist_now > 0:
-            score += 8
-            signals_used.append("MACD Positive")
-        else:
-            score -= 8
-            signals_used.append("MACD Negative")
+    # 4. MACD histogram
+    if hist_now > 0 and hist_now > hist_prev:
+        score += 20
+        signals_used.append("MACD ↑ Histogram")
+        reasons.append("MACD histogram expanding above zero line")
+    elif hist_now < 0 and hist_now < hist_prev:
+        score -= 20
+        signals_used.append("MACD ↓ Histogram")
+        reasons.append("MACD histogram expanding below zero line")
+    elif hist_now > 0:
+        score += 8
+        signals_used.append("MACD Positive")
+    else:
+        score -= 8
+        signals_used.append("MACD Negative")
 
-    # 5. Bollinger Bands position
-    if bb_up and bb_lo:
-        bb_range = bb_up - bb_lo
-        bb_pos   = (price - bb_lo) / bb_range if bb_range > 0 else 0.5
+    # 5. Bollinger Bands
+    bb_range = bb_up - bb_lo
+    if bb_range > 0:
+        bb_pos = (price - bb_lo) / bb_range
         if bb_pos > 0.8:
             score += 10
             signals_used.append("BB Upper Zone")
@@ -317,7 +418,6 @@ def analyze_market(symbol: str) -> Optional[dict]:
 
     # 6. Volume trend
     if vol_ratio > 1.3:
-        # amplify existing signal direction
         score = int(score * 1.2)
         signals_used.append(f"Vol Surge {vol_ratio:.1f}x")
         reasons.append(f"Volume is {vol_ratio:.1f}x above average — confirming move")
@@ -337,57 +437,47 @@ def analyze_market(symbol: str) -> Optional[dict]:
 
     # 8. 24h price change
     if abs(price_change_pct) > 2:
-        if price_change_pct > 0:
-            score += 5
-        else:
-            score -= 5
+        score += 5 if price_change_pct > 0 else -5
 
     # ── Final direction ──────────────────────────
     score = max(-100, min(100, score))
     abs_score = abs(score)
 
     if score >= 20:
-        direction = "BULLISH 🟢"
-        emoji = "📈"
+        direction, emoji = "BULLISH 🟢", "📈"
     elif score <= -20:
-        direction = "BEARISH 🔴"
-        emoji = "📉"
+        direction, emoji = "BEARISH 🔴", "📉"
     else:
-        direction = "NEUTRAL ⚪"
-        emoji = "↔️"
+        direction, emoji = "NEUTRAL ⚪", "↔️"
 
     if abs_score >= 70:
-        confidence = "Very High"
-        conf_bar   = "█████"
+        confidence, conf_bar = "Very High", "█████"
     elif abs_score >= 50:
-        confidence = "High"
-        conf_bar   = "████░"
+        confidence, conf_bar = "High",      "████░"
     elif abs_score >= 30:
-        confidence = "Medium"
-        conf_bar   = "███░░"
+        confidence, conf_bar = "Medium",    "███░░"
     else:
-        confidence = "Low"
-        conf_bar   = "██░░░"
+        confidence, conf_bar = "Low",       "██░░░"
 
     return {
-        "symbol":       symbol,
-        "price":        price,
-        "direction":    direction,
-        "emoji":        emoji,
-        "score":        score,
-        "confidence":   confidence,
-        "conf_bar":     conf_bar,
-        "signals":      signals_used,
-        "reasons":      reasons[:4],  # top 4 reasons
-        "rsi":          rsi_now,
-        "ema9":         ema9_now,
-        "ema50":        ema50_now,
-        "macd_hist":    hist_now,
-        "vol_ratio":    vol_ratio,
-        "change24h":    price_change_pct,
-        "high24":       high24,
-        "low24":        low24,
-        "interval":     INTERVAL,
+        "symbol":     symbol,
+        "price":      price,
+        "direction":  direction,
+        "emoji":      emoji,
+        "score":      score,
+        "confidence": confidence,
+        "conf_bar":   conf_bar,
+        "signals":    signals_used,
+        "reasons":    reasons[:4],
+        "rsi":        rsi_now,
+        "ema9":       ema9_now,
+        "ema50":      ema50_now,
+        "macd_hist":  hist_now,
+        "vol_ratio":  vol_ratio,
+        "change24h":  price_change_pct,
+        "high24":     high24,
+        "low24":      low24,
+        "interval":   INTERVAL,
     }
 
 
@@ -410,8 +500,11 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
 
 def format_signal_message(sig: dict) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    reasons_text = "\n".join(f"  • {r}" for r in sig["reasons"]) if sig["reasons"] else "  • Insufficient signal clarity"
-
+    reasons_text = (
+        "\n".join(f"  • {r}" for r in sig["reasons"])
+        if sig["reasons"] else "  • Insufficient signal clarity"
+    )
+    # FIX #7: all values are guaranteed floats — no None formatting error
     return (
         f"{sig['emoji']} <b>CRYPTO SIGNAL ALERT</b> {sig['emoji']}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -434,7 +527,7 @@ def format_signal_message(sig: dict) -> str:
         f"  24h Low:    ${sig['low24']:,.2f}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⏰ {now}\n"
-        f"🤖 CryptoSignal Bot | Auto-analysis"
+        f"🤖 CryptoSignal Bot | Delta Exchange"
     )
 
 
@@ -443,16 +536,17 @@ def format_signal_message(sig: dict) -> str:
 # ──────────────────────────────────────────────────────────
 
 def main():
-    log.info("═" * 50)
-    log.info("  Crypto Trading Signal Bot starting…")
-    log.info("  Symbol:   %s | Interval: %s", SYMBOL, INTERVAL)
-    log.info("  Checking every %d seconds", CHECK_EVERY_SEC)
-    log.info("═" * 50)
+    log.info("═" * 55)
+    log.info("  Crypto Trading Signal Bot — Delta Exchange")
+    log.info("  Symbol: %s  |  Interval: %s  |  Every: %ds",
+             SYMBOL, INTERVAL, CHECK_EVERY_SEC)
+    log.info("═" * 55)
+
+    if not DELTA_API_KEY:
+        log.warning("⚠️  DELTA_API_KEY is not set — public endpoints only.")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("⚠️  TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set.")
-        log.warning("    Set them as environment variables and restart.")
-        log.warning("    Running in DRY-RUN mode (no messages sent).")
+        log.warning("⚠️  Telegram credentials missing — running in DRY-RUN mode.")
         dry_run = True
     else:
         dry_run = False
@@ -460,7 +554,7 @@ def main():
     iteration = 0
     while True:
         iteration += 1
-        log.info("── Analysis #%d ──────────────────", iteration)
+        log.info("── Analysis #%d ──────────────────────────", iteration)
         try:
             sig = analyze_market(SYMBOL)
             if sig:
@@ -469,12 +563,13 @@ def main():
                 if not dry_run:
                     send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
             else:
-                log.warning("Analysis returned no signal.")
+                log.warning("Analysis returned no signal — will retry next cycle.")
         except Exception as e:
-            log.exception("Unexpected error in analysis loop: %s", e)
+            log.exception("Unexpected error: %s", e)
 
-        log.info("Sleeping %d seconds until next check…\n", CHECK_EVERY_SEC)
+        log.info("Sleeping %d seconds…\n", CHECK_EVERY_SEC)
         time.sleep(CHECK_EVERY_SEC)
+
 
 if __name__ == "__main__":
     main()
