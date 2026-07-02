@@ -567,8 +567,7 @@ def main():
         except Exception as e:
             log.exception("Unexpected error: %s", e)
 
-        log.info("Sleeping %d seconds…\n", CHECK_EVERY_SEC)
-        time.sleep(CHECK_EVERY_SEC)
+        log.info("Sleeping %d seconds…\n", CHECK_EVERY_SEC)        time.sleep(CHECK_EVERY_SEC)
 
 
 if __name__ == "__main__":
