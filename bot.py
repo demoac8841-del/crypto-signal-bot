@@ -568,6 +568,7 @@ def main():
             log.exception("Unexpected error: %s", e)
 
         log.info("Sleeping %d seconds…\n", CHECK_EVERY_SEC)
+      
         time.sleep(CHECK_EVERY_SEC)
 
 
